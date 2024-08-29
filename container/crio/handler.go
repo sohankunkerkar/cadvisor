@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/opencontainers/runc/libcontainer/cgroups"
+	"k8s.io/klog/v2"
 
 	"github.com/google/cadvisor/container"
 	"github.com/google/cadvisor/container/common"
@@ -89,12 +90,16 @@ func newCrioContainerHandler(
 	metadataEnvAllowList []string,
 	includedMetrics container.MetricSet,
 ) (container.ContainerHandler, error) {
+	klog.V(4).Infof("Creating a new CRI-O container handler for %q", name)
 	// Create the cgroup paths.
 	cgroupPaths := common.MakeCgroupPaths(cgroupSubsystems, name)
+
+	klog.V(4).Infof("Cgroup paths created: %+v", cgroupPaths)
 
 	// Generate the equivalent cgroup manager for this container.
 	cgroupManager, err := containerlibcontainer.NewCgroupManager(name, cgroupPaths)
 	if err != nil {
+		klog.Errorf("Failed to create cgroup manager: %v", err)
 		return nil, err
 	}
 
@@ -104,10 +109,12 @@ func newCrioContainerHandler(
 	}
 
 	id := ContainerNameToCrioId(name)
+	klog.V(4).Infof("Container ID resolved to: %s", id)
 	pidKnown := true
 
 	cInfo, err := client.ContainerInfo(id)
 	if err != nil {
+		klog.Errorf("Failed to get container info: %v", err)
 		return nil, err
 	}
 	if cInfo.Pid == 0 {
@@ -118,6 +125,7 @@ func newCrioContainerHandler(
 		// calls to crio.
 		pidKnown = false
 	}
+	klog.V(4).Infof("Container Info: %+v", cInfo)
 
 	// passed to fs handler below ...
 	// XXX: this is using the full container logpath, as constructed by the CRI
@@ -134,6 +142,7 @@ func newCrioContainerHandler(
 	// get device ID from root, otherwise, it's going to error out as overlay
 	// mounts doesn't have fixed dev ids.
 	rootfsStorageDir = strings.TrimSuffix(rootfsStorageDir, "/merged")
+	klog.V(4).Infof("Rootfs storage directory: %s", rootfsStorageDir)
 	switch storageDriver {
 	case overlayStorageDriver, overlay2StorageDriver:
 		// overlay and overlay2 driver are the same "overlay2" driver so treat
@@ -148,13 +157,16 @@ func newCrioContainerHandler(
 		Namespace: CrioNamespace,
 	}
 
-	// In a Kubernetes pod, all containers share the same network namespace.
-	// If the infrastructure container has empty network metrics, the CRI-O
-	// handler uses a running container in the pod to gather the necessary
-	// metrics. Therefore, it is essential to collect network metrics from
-	// all containers to ensure that if there is any running container in
-	// the pod, we capture the required network metrics for accurate reporting.
-	metrics := includedMetrics
+	// Find out if we need network metrics reported for this container.
+	// Containers that don't have their own network -- this includes
+	// containers running in Kubernetes pods that use the network of the
+	// infrastructure container -- does not need their stats to be
+	// reported. This stops metrics being reported multiple times for each
+	// container in a pod.
+	metrics := common.RemoveNetMetrics(includedMetrics, cInfo.Labels["io.kubernetes.container.name"] != "POD")
+
+	// Log the metrics being used
+	klog.V(4).Infof("Included metrics for container %s: %+v", name, metrics)
 
 	libcontainerHandler := containerlibcontainer.NewHandler(cgroupManager, rootFs, cInfo.Pid, metrics)
 
@@ -198,7 +210,8 @@ func newCrioContainerHandler(
 	//for _, exposedEnv := range metadataEnvAllowList {
 	//klog.V(4).Infof("TODO env whitelist: %v", exposedEnv)
 	//}
-
+	// Log the creation of the handler
+	klog.V(4).Infof("Successfully created CRI-O container handler for container: %s", name)
 	return handler, nil
 }
 
